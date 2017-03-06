@@ -1,3 +1,7 @@
+// This is a FastCGI server acting as a Responder role.
+//
+// It exists to help me debug a FastCGI web server (client) implementation.
+//
 // Specification:
 // https://web.archive.org/web/20150420080736/http://www.fastcgi.com/drupal/node/6?q=node/22
 package main
