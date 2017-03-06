@@ -39,11 +39,13 @@ func main() {
 type Args struct {
 	BodySize        int
 	WriteEachRecord bool
+	MaxContentSize  int
 }
 
 func getArgs() (*Args, error) {
 	bodySize := flag.Int("body-size", 1024, "Size of body to send in bytes")
 	writeEachRecord := flag.Bool("write-each-record", true, "Write each record as it is ready (true) or entire response in one (false).")
+	maxContentSize := flag.Int("max-content-size", 65535, "The maximum number of many bytes to put in each record's content field. This cannot exceed 65535.")
 
 	flag.Parse()
 
@@ -51,9 +53,14 @@ func getArgs() (*Args, error) {
 		return nil, fmt.Errorf("body size must be > 0")
 	}
 
+	if *maxContentSize <= 0 || *maxContentSize > 65535 {
+		return nil, fmt.Errorf("max content size must be [1, 65535]")
+	}
+
 	return &Args{
 		BodySize:        *bodySize,
 		WriteEachRecord: *writeEachRecord,
+		MaxContentSize:  *maxContentSize,
 	}, nil
 }
 
@@ -116,7 +123,7 @@ func handleConnection(conn net.Conn, args *Args) {
 
 			// Once we see stdin we can send our response as stdout stream
 			if err := sendResponse(conn, record.RequestID, args.BodySize,
-				args.WriteEachRecord); err != nil {
+				args.WriteEachRecord, args.MaxContentSize); err != nil {
 				fmt.Fprintf(os.Stderr, "sending response: %s\n", err)
 				break
 			}
@@ -404,7 +411,7 @@ func parseStdin(record *Record) error {
 }
 
 func sendResponse(writer io.Writer, requestID uint16, bodySize int,
-	writeEachRecord bool) error {
+	writeEachRecord bool, maxContentSize int) error {
 	// Send FCGIStdout records until we've sent the entire response.
 
 	body := make([]byte, bodySize)
@@ -420,7 +427,8 @@ func sendResponse(writer io.Writer, requestID uint16, bodySize int,
 
 	// Send stream of FCGIStdout records containing the headers and body. These
 	// are application stream records.
-	buf, err := sendStream(writer, requestID, payload, writeEachRecord)
+	buf, err := sendStream(writer, requestID, payload, writeEachRecord,
+		maxContentSize)
 	if err != nil {
 		return fmt.Errorf("error sending stream: %s", err)
 	}
@@ -460,15 +468,12 @@ func sendResponse(writer io.Writer, requestID uint16, bodySize int,
 }
 
 func sendStream(writer io.Writer, requestID uint16,
-	payload []byte, writeEachRecord bool) ([]byte, error) {
+	payload []byte, writeEachRecord bool, maxContentSize int) ([]byte, error) {
 	// Send FCGIStdout record(s) containing the payload. We may need multiple
 	// as each can contain a maximum of 65535 bytes.
 
-	//maxContentSize := 65500
-	maxContentSize := 65535
-
-	// We could write out each record as we go. However a Node.js implementation
-	// causing lighttpd issues writes once. Try that.
+	// Collect the entire response paylod. Depending on whether we're writing
+	// records out as they are ready or not, we may send the payload all at once.
 	buf := []byte{}
 
 	for i := 0; i < len(payload); i += maxContentSize {
