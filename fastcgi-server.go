@@ -3,6 +3,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"io"
 	"net"
@@ -10,6 +11,13 @@ import (
 )
 
 func main() {
+	args, err := getArgs()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Invalid argument: %s\n", err)
+		flag.PrintDefaults()
+		os.Exit(1)
+	}
+
 	ln, err := net.Listen("tcp", ":9901")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Unable to listen: %s\n", err)
@@ -23,16 +31,33 @@ func main() {
 			continue
 		}
 
-		go handleConnection(conn)
+		go handleConnection(conn, args)
 	}
 }
 
-func handleConnection(conn net.Conn) {
+// Args hold command line arguments.
+type Args struct {
+	BodySize int
+}
+
+func getArgs() (*Args, error) {
+	bodySize := flag.Int("body-size", 1024, "Size of body to send in bytes")
+
+	flag.Parse()
+
+	if *bodySize <= 0 {
+		return nil, fmt.Errorf("body size must be > 0")
+	}
+
+	return &Args{BodySize: *bodySize}, nil
+}
+
+func handleConnection(conn net.Conn, args *Args) {
 	fmt.Printf("new connection from %s\n", conn.RemoteAddr())
 
 	// Track whether we should close the connection after responding to a request.
 	// RequestID -> bool whether to close.
-	closeAfterRequest := map[int16]bool{}
+	closeAfterRequest := map[uint16]bool{}
 
 	for {
 		record, err := readRecord(conn)
@@ -85,7 +110,7 @@ func handleConnection(conn net.Conn) {
 			fmt.Printf("received stdin record\n")
 
 			// Once we see stdin we can send our response as stdout stream
-			if err := sendResponse(conn, record.RequestID); err != nil {
+			if err := sendResponse(conn, record.RequestID, args.BodySize); err != nil {
 				fmt.Fprintf(os.Stderr, "sending response: %s\n", err)
 				break
 			}
@@ -117,18 +142,18 @@ func handleConnection(conn net.Conn) {
 
 // Record holds a FastCGI record. See section 3.3 in the specification.
 type Record struct {
-	Version       int8
+	Version       uint8
 	Type          RecordType
-	RequestID     int16
-	ContentLength int16
-	PaddingLength int8
-	Reserved      int8
+	RequestID     uint16
+	ContentLength uint16
+	PaddingLength uint8
+	Reserved      uint8
 	ContentData   []byte
 	PaddingData   []byte
 }
 
 // RecordType is one of the FastCGI record types.
-type RecordType int8
+type RecordType uint8
 
 const (
 	// FCGIBeginRequest is a type component of FCGI_Header
@@ -172,28 +197,28 @@ func readRecord(reader io.Reader) (*Record, error) {
 	}
 
 	idx := 0
-	version := int8(header[idx])
+	version := uint8(header[idx])
 	if version != 1 {
 		return nil, fmt.Errorf("unexpected version: %.2x", header[idx])
 	}
 	idx++
 
-	recordType := getRecordType(int8(header[idx]))
+	recordType := getRecordType(uint8(header[idx]))
 	if recordType == FCGIUnknownType {
 		return nil, fmt.Errorf("unknown record type: %.2x", header[idx])
 	}
 	idx++
 
-	requestID := int16(int16(header[idx])<<8) | int16(header[idx+1])
+	requestID := uint16(uint16(header[idx])<<8) | uint16(header[idx+1])
 	idx += 2
 
-	contentLength := int16(int16(header[idx])<<8) | int16(header[idx+1])
+	contentLength := uint16(uint16(header[idx])<<8) | uint16(header[idx+1])
 	idx += 2
 
-	paddingLength := int8(header[idx])
+	paddingLength := uint8(header[idx])
 	idx++
 
-	reserved := int8(header[idx])
+	reserved := uint8(header[idx])
 	if reserved != 0 {
 		return nil, fmt.Errorf("reserved value is not 0: %.2x", header[idx])
 	}
@@ -236,7 +261,7 @@ func readFull(reader io.Reader, data []byte) error {
 	return nil
 }
 
-func getRecordType(t int8) RecordType {
+func getRecordType(t uint8) RecordType {
 	switch t {
 	case 1:
 		return FCGIBeginRequest
@@ -266,11 +291,11 @@ func getRecordType(t int8) RecordType {
 // BeginRequest holds informatino for the FCGI_BeginRequestBody struct.
 type BeginRequest struct {
 	Role  Role
-	Flags int8
+	Flags uint8
 }
 
 // Role is a FCGI Role
-type Role int16
+type Role uint16
 
 const (
 	// FCGIResponder is an FCGI role
@@ -286,8 +311,8 @@ const (
 func parseBeginRequest(record *Record) (*BeginRequest, error) {
 	idx := 0
 
-	rawRole := int16((int16(record.ContentData[idx]) << 8) |
-		int16(record.ContentData[idx+1]))
+	rawRole := uint16((uint16(record.ContentData[idx]) << 8) |
+		uint16(record.ContentData[idx+1]))
 	role := getRole(rawRole)
 	if role == FCGIUnknownRole {
 		return nil, fmt.Errorf("unknown role: %.2x %.2x", record.ContentData[idx],
@@ -295,7 +320,7 @@ func parseBeginRequest(record *Record) (*BeginRequest, error) {
 	}
 	idx += 2
 
-	flags := int8(record.ContentData[idx])
+	flags := uint8(record.ContentData[idx])
 	idx++
 
 	return &BeginRequest{
@@ -304,7 +329,7 @@ func parseBeginRequest(record *Record) (*BeginRequest, error) {
 	}, nil
 }
 
-func getRole(r int16) Role {
+func getRole(r uint16) Role {
 	switch r {
 	case 1:
 		return FCGIResponder
@@ -372,57 +397,104 @@ func parseStdin(record *Record) error {
 	return nil
 }
 
-func sendResponse(writer io.Writer, requestID int16) error {
+func sendResponse(writer io.Writer, requestID uint16, bodySize int) error {
 	// Send FCGIStdout records until we've sent the entire response.
 
-	body := "hi there"
-	headers := fmt.Sprintf("Content-Type: text/plain\r\n")
-	response := []byte(fmt.Sprintf("%s\r\n%s", headers, body))
+	body := make([]byte, bodySize)
+	for i := 0; i < bodySize; i++ {
+		body[i] = 'a'
+	}
+
+	headers := []byte("Content-Type: text/plain\r\nConnection: close\r\n\r\n")
+
+	payload := make([]byte, 0, len(body)+len(headers))
+	payload = append(payload, headers...)
+	payload = append(payload, body...)
+
+	// Send stream of FCGIStdout records containing the headers and body. These
+	// are application stream records.
+	buf, err := sendStream(writer, requestID, payload)
+	if err != nil {
+		return fmt.Errorf("error sending stream: %s", err)
+	}
+
+	// Then send FCGIEndRequest record to indicate the end.
+
+	// Make the FCGIEndRequest.
+
+	endRecordBuf := make([]byte, 8)
+
+	// Set app status on the record. This is the first four bytes. Leave them as
+	// zero. It's to indicate the exit status.
+
+	// Set protocol status. 1 byte. Leave as 0. This is FCGI_REQUEST_COMPLETE.
+
+	endRec := Record{
+		Type:        FCGIEndRequest,
+		RequestID:   requestID,
+		ContentData: endRecordBuf,
+	}
+
+	//if err := writeAll(writer, rec.serialize()); err != nil {
+	//	return fmt.Errorf("error writing end request: %s", err)
+	//}
+
+	buf = append(buf, endRec.serialize()...)
+
+	if err := writeAll(writer, buf); err != nil {
+		return fmt.Errorf("error writing all: %s", err)
+	}
+
+	return nil
+}
+
+func sendStream(writer io.Writer, requestID uint16,
+	payload []byte) ([]byte, error) {
+	// Send FCGIStdout record(s) containing the payload. We may need multiple
+	// as each can contain a maximum of 65535 bytes.
+
+	//maxContentSize := 65500
+	maxContentSize := 65535
+
+	// We could write out each record as we go. However a Node.js implementation
+	// causing lighttpd issues writes once. Try that.
+	buf := []byte{}
+
+	for i := 0; i < len(payload); i += maxContentSize {
+		end := i + maxContentSize
+		if end > len(payload) {
+			end = len(payload)
+		}
+
+		rec := Record{
+			Type:        FCGIStdout,
+			RequestID:   requestID,
+			ContentData: payload[i:end],
+		}
+
+		fmt.Printf("sending payload (%d bytes)\n", len(payload[i:end]))
+
+		//if err := writeAll(writer, rec.serialize()); err != nil {
+		//	return fmt.Errorf("error writing stdout record: %s", err)
+		//}
+		buf = append(buf, rec.serialize()...)
+	}
+
+	// Send a zero length FCGIStdout record to indicate end of the stream.
 
 	rec := Record{
-		Type:        FCGIStdout,
-		RequestID:   requestID,
-		ContentData: response,
-	}
-
-	if err := writeAll(writer, rec.serialize()); err != nil {
-		return fmt.Errorf("writing stdout: %s", err)
-	}
-	fmt.Printf("sent stdout record: %#v\n", rec.serialize())
-
-	// Zero length FCGIStdout record to indicate end of stream.
-
-	rec = Record{
 		Type:        FCGIStdout,
 		RequestID:   requestID,
 		ContentData: []byte{},
 	}
 
-	if err := writeAll(writer, rec.serialize()); err != nil {
-		return fmt.Errorf("writing stdout (end of stream): %s", err)
-	}
-	fmt.Printf("sent stdout record: %#v\n", rec.serialize())
+	//if err := writeAll(writer, rec.serialize()); err != nil {
+	//	return fmt.Errorf("error writing stdout record (end of stream): %s", err)
+	//}
 
-	// Then send FCGIEndRequest record to indicate the end.
+	buf = append(buf, rec.serialize()...)
 
-	buf := make([]byte, 8)
-
-	// App status. Four bytes. Leave as zero. It's to indicate the exit status.
-
-	// Protocol status. 1 byte. Leave as 0. This is FCGI_REQUEST_COMPLETE.
-
-	rec = Record{
-		Type:        FCGIEndRequest,
-		RequestID:   requestID,
-		ContentData: buf,
-	}
-
-	if err := writeAll(writer, rec.serialize()); err != nil {
-		return fmt.Errorf("writing end request: %s", err)
-	}
-	fmt.Printf("sent endrequest record: %#v\n", rec.serialize())
-
-	return nil
+	return buf, nil
 }
 
 func (r Record) serialize() []byte {
@@ -464,6 +536,8 @@ func (r Record) serialize() []byte {
 }
 
 func writeAll(writer io.Writer, buf []byte) error {
+	fmt.Printf("writing %d bytes...\n", len(buf))
+
 	n, err := writer.Write(buf)
 	if err != nil {
 		return err
@@ -472,6 +546,8 @@ func writeAll(writer io.Writer, buf []byte) error {
 	if n != len(buf) {
 		return fmt.Errorf("short write. wrote %d, wanted %d", n, len(buf))
 	}
+
+	fmt.Printf("wrote %d bytes\n", len(buf))
 
 	return nil
 }
