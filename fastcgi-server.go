@@ -1,8 +1,12 @@
 // This is a FastCGI server acting as a Responder role.
 //
-// It exists to help me debug a FastCGI web server (client) implementation.
+// While it partially implements the FastCGI protocol, I mainly use it for
+// debugging FastCGI web servers that connect to FastCGI servers. Beyond its
+// command line arguments, I've hardcoded its response and behaviour. In
+// particular, its response body currently only ever contains a string of 'a'
+// characters (of varying lengths to facilitate testing).
 //
-// Specification:
+// FastCGI specification:
 // https://web.archive.org/web/20150420080736/http://www.fastcgi.com/drupal/node/6?q=node/22
 package main
 
